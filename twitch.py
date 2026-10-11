@@ -78,6 +78,13 @@ SAFE_LOADS = lambda s: json.loads(s, cls=SkipExtraJsonDecoder)
 
 
 class _AuthState:
+    # Twitch stopped issuing device codes to the Android app client in Sep 2026.
+    # SMARTBOX still gets device codes, so it is used for the device auth flow only.
+    # Browsing/GQL continue to use self._twitch._client_type (ANDROID_APP).
+    # NOTE: SMARTBOX's ViewerDropsDashboard returns an empty campaign list,
+    # hence the public catalog fallback in fetch_campaign_catalog().
+    LOGIN_CLIENT: ClientInfo = ClientType.SMARTBOX
+
     def __init__(self, twitch: Twitch):
         self._twitch: Twitch = twitch
         self._lock = asyncio.Lock()
@@ -86,6 +93,7 @@ class _AuthState:
         self.device_id: str
         self.session_id: str
         self.access_token: str
+        self.token_client_id: str
         self.client_version: str
 
     def _hasattrs(self, *attrs: str) -> bool:
@@ -97,7 +105,7 @@ class _AuthState:
                 delattr(self, attr)
 
     def invalidate(self, *, delete_cookies: bool = False) -> None:
-        self._delattrs("access_token", "user_id")
+        self._delattrs("access_token", "user_id", "token_client_id")
         self._logged_in.clear()
         self._twitch.gui.help._invalidate_button.config(state="disabled")
         if delete_cookies:
@@ -113,6 +121,7 @@ class _AuthState:
             "device_id",
             "session_id",
             "access_token",
+            "token_client_id",
             "client_version",
         )
         self._logged_in.clear()
@@ -120,7 +129,8 @@ class _AuthState:
 
     async def _oauth_login(self) -> str:
         login_form: LoginForm = self._twitch.gui.login
-        client_info: ClientInfo = self._twitch._client_type
+        # Always use the dedicated login client for device auth - never the browsing client.
+        client_info: ClientInfo = self.LOGIN_CLIENT
         headers = {
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
@@ -152,17 +162,40 @@ class _AuthState:
                     #     "verification_uri": "https://www.twitch.tv/activate?device-code=ABCDEFGH"
                     # }
                     response_json: JsonType = await response.json()
-                    device_code: str = response_json["device_code"]
-                    user_code: str = response_json["user_code"]
-                    interval: int = response_json["interval"]
-                    verification_uri: URL = URL(response_json["verification_uri"])
-                    expires_at = now + timedelta(seconds=response_json["expires_in"])
+                    required_fields = (
+                        "device_code",
+                        "user_code",
+                        "interval",
+                        "verification_uri",
+                        "expires_in",
+                    )
+                    missing_fields = [
+                        field for field in required_fields if field not in response_json
+                    ]
+                    if response.status != 200 or missing_fields:
+                        # Twitch returns an error JSON (for ex. {"error": "invalid client"})
+                        # when a client is no longer eligible for device authorization.
+                        # Don't turn that into an opaque KeyError: surface a login error.
+                        error_detail = cast(
+                            str,
+                            response_json.get("message")
+                            or response_json.get("error")
+                            or f"HTTP {response.status}",
+                        )
+                        raise LoginException(
+                            f"Twitch device authorization failed: {error_detail}"
+                        )
+                    device_code: str = cast(str, response_json["device_code"])
+                    user_code: str = cast(str, response_json["user_code"])
+                    interval: int = int(response_json["interval"])
+                    verification_uri: URL = URL(cast(str, response_json["verification_uri"]))
+                    expires_at = now + timedelta(seconds=int(response_json["expires_in"]))
 
                 # Print the code to the user, open them the activate page so they can type it in
                 await login_form.ask_enter_code(verification_uri, user_code)
 
                 payload = {
-                    "client_id": self._twitch._client_type.CLIENT_ID,
+                    "client_id": client_info.CLIENT_ID,
                     "device_code": device_code,
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 }
@@ -331,6 +364,14 @@ class _AuthState:
             return self.access_token
         raise LoginException("Login flow finished without setting the access token")
 
+    @property
+    def needs_catalog_fallback(self) -> bool:
+        """
+        True when the current token was minted under a client that Twitch
+        withholds the full campaign dashboard from (currently SMARTBOX).
+        """
+        return getattr(self, "token_client_id", '') == self.LOGIN_CLIENT.CLIENT_ID
+
     def headers(self, *, user_agent: str = '', gql: bool = False) -> JsonType:
         client_info: ClientInfo = self._twitch._client_type
         headers = {
@@ -410,8 +451,10 @@ class _AuthState:
                             break
                 else:
                     raise RuntimeError("Login verification failure (step #2)")
-                # ensure the cookie's client ID matches the currently selected client
-                if validate_response["client_id"] == client_info.CLIENT_ID:
+                # ensure the token was minted under the login client ID.
+                # _oauth_login() always uses LOGIN_CLIENT now, regardless of which
+                # client is used for browsing/scraping.
+                if validate_response["client_id"] == self.LOGIN_CLIENT.CLIENT_ID:
                     break
                 # otherwise, we need to delete the entire cookie file and clear the jar
                 logger.info("Cookie client ID mismatch")
@@ -420,6 +463,7 @@ class _AuthState:
             else:
                 raise RuntimeError("Login verification failure (step #1)")
             self.user_id = int(validate_response["user_id"])
+            self.token_client_id = str(validate_response["client_id"])
             cookie["persistent"] = str(self.user_id)
             logger.info(f"Login successful, user ID: {self.user_id}")
             login_form.update(_("gui", "login", "logged_in"), self.user_id)
@@ -1319,52 +1363,88 @@ class Twitch:
             else:
                 response_list = [response_json]
             force_retry: bool = False
-            for response_json in response_list:
+            for response_index, response_json in enumerate(response_list):
+                if not isinstance(response_json, dict):
+                    raise GQLException(f"Unexpected GQL response: {response_json!r}")
+
+                # Twitch error responses don't consistently include
+                # extensions.operationName. Fall back to the submitted operation so
+                # logging an error never becomes a second, fatal KeyError (#1116).
+                extensions = response_json.get("extensions")
+                operation_name: str | None = (
+                    cast(str | None, extensions.get("operationName"))
+                    if isinstance(extensions, dict)
+                    else None
+                )
+                if operation_name is None:
+                    submitted_op: GQLOperation | None
+                    if isinstance(ops, list):
+                        submitted_op = ops[response_index] if response_index < len(ops) else None
+                    else:
+                        submitted_op = ops
+                    if isinstance(submitted_op, dict):
+                        operation_name = cast(str | None, submitted_op.get("operationName"))
+                operation_name = operation_name or "<unknown operation>"
+
                 # GQL error handling
                 if "errors" in response_json:
+                    handled_error = False
                     for error_dict in response_json["errors"]:
-                        if "message" in error_dict:
-                            if (
-                                single_retry
-                                and error_dict["message"] in (
-                                    "service error",
-                                    "PersistedQueryNotFound",
-                                )
-                            ):
-                                logger.error(
-                                    f"Retrying a {error_dict['message']} for "
-                                    f"{response_json['extensions']['operationName']}"
-                                )
-                                single_retry = False
-                                if delay < 5:
-                                    # overwrite the delay if too short
-                                    delay = 5
-                                force_retry = True
+                        if not isinstance(error_dict, dict):
+                            continue
+                        message = error_dict.get("message")
+                        if not isinstance(message, str):
+                            continue
+
+                        if message == "PersistedQueryNotFound" and single_retry:
+                            logger.error(f"Retrying {message} for {operation_name}")
+                            single_retry = False
+                            if delay < 5:
+                                # overwrite the delay if too short
+                                delay = 5
+                            force_retry = True
+                            handled_error = True
+                            break
+
+                        if message == "server error":
+                            # Some server errors include a valid GraphQL path so the
+                            # failed field can be treated as null. If Twitch omits or
+                            # changes that path, retry instead of crashing on path[-1].
+                            data_obj = response_json.get("data")
+                            path = error_dict.get("path")
+                            if isinstance(data_obj, dict) and isinstance(path, list) and path:
+                                target: Any = data_obj
+                                try:
+                                    for key in path[:-1]:
+                                        target = target[key]
+                                    target[path[-1]] = None
+                                except (KeyError, IndexError, TypeError):
+                                    force_retry = True
+                                handled_error = True
                                 break
-                            elif error_dict["message"] == "server error":
-                                # nullify the key the error path points to
-                                data_dict: JsonType = response_json["data"]
-                                path: list[str] = error_dict.get("path", [])
-                                for key in path[:-1]:
-                                    data_dict = data_dict[key]
-                                data_dict[path[-1]] = None
-                                break
-                            elif (
-                                error_dict["message"] in (
-                                    "service timeout",
-                                    "request cancelled",
-                                    "service unavailable",
-                                    "context deadline exceeded",
-                                )
-                            ):
-                                force_retry = True
-                                break
-                    else:
-                        raise GQLException(response_json['errors'])
+                            force_retry = True
+                            handled_error = True
+                            break
+
+                        if message in (
+                            "service error",
+                            "service timeout",
+                            "request cancelled",
+                            "service unavailable",
+                            "context deadline exceeded",
+                        ):
+                            logger.warning(f"Retrying {message} for {operation_name}")
+                            force_retry = True
+                            handled_error = True
+                            break
+
+                    if not handled_error:
+                        raise GQLException(response_json["errors"])
                 # Other error handling
                 elif "error" in response_json:
                     raise GQLException(
-                        f"{response_json['error']}: {response_json['message']}"
+                        f"{response_json.get('error', 'GQL error')}: "
+                        f"{response_json.get('message', 'No message')}"
                     )
                 if force_retry:
                     break
@@ -1412,6 +1492,124 @@ class Twitch:
         }
         return self._merge_data(campaign_ids, fetched_data)
 
+    async def fetch_campaign_catalog(self) -> dict[str, JsonType]:
+        """
+        Fetch public campaign metadata from the Sunkwi Twitch Drops catalog.
+
+        Twitch's login-capable client does not expose the complete drops campaign
+        dashboard, so the public catalog is used as the discovery layer only.
+        Authentication, inventory progress, websocket updates, watch events and
+        claiming remain direct Twitch calls.
+
+        Privacy: this uses a separate cookie-less session with no Authorization
+        header - no Twitch cookies or tokens are ever sent to the third party.
+        """
+        catalog_url = "https://twitch-drops-api.sunkwi.com/v2/drops"
+        request_kwargs: JsonType = {"headers": {"Accept": "application/json"}}
+        if self.settings.proxy:
+            request_kwargs["proxy"] = self.settings.proxy
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                cookie_jar=aiohttp.DummyCookieJar(),
+                headers={"User-Agent": "TwitchDropsMiner campaign fallback"},
+            ) as session:
+                async with session.get(catalog_url, **request_kwargs) as response:
+                    if response.status != 200:
+                        raise RequestException(
+                            f"Campaign catalog returned HTTP {response.status}"
+                        )
+                    payload: JsonType = await response.json()
+        except (
+            aiohttp.ClientError, asyncio.TimeoutError, ValueError, RequestException
+        ) as exc:
+            logger.warning(f"Campaign catalog fallback failed: {exc}")
+            return {}
+
+        groups = payload.get("data")
+        if not isinstance(groups, list):
+            logger.warning("Campaign catalog fallback returned an invalid payload")
+            return {}
+
+        # Reject stale snapshots instead of presenting campaigns that may have ended.
+        last_updated_raw = payload.get("lastUpdatedAt")
+        refresh_interval = payload.get("refreshIntervalSeconds", 60)
+        try:
+            refresh_seconds = max(1, int(refresh_interval))
+            last_updated = timestamp(cast(str, last_updated_raw))
+        except (TypeError, ValueError):
+            logger.warning("Campaign catalog fallback returned invalid freshness metadata")
+            return {}
+        now = datetime.now(timezone.utc)
+        max_age = timedelta(seconds=max(300, refresh_seconds * 5))
+        if last_updated > now + timedelta(minutes=2) or now - last_updated > max_age:
+            logger.warning(
+                "Campaign catalog fallback is stale; refusing to use outdated campaign data"
+            )
+            return {}
+
+        applicable_statuses = ("ACTIVE", "UPCOMING")
+        campaigns: dict[str, JsonType] = {}
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            box_art_url = group.get("gameBoxArtURL", "")
+            rewards = group.get("rewards") or []
+            if not isinstance(rewards, list):
+                continue
+            for raw_campaign in rewards:
+                if not isinstance(raw_campaign, dict):
+                    continue
+                campaign_id = raw_campaign.get("id")
+                if (
+                    not isinstance(campaign_id, str)
+                    or raw_campaign.get("status") not in applicable_statuses
+                ):
+                    continue
+                try:
+                    campaign_start = timestamp(cast(str, raw_campaign["startAt"]))
+                    campaign_end = timestamp(cast(str, raw_campaign["endAt"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # Don't trust a cached ACTIVE/UPCOMING status past the real end time.
+                if campaign_end <= now:
+                    continue
+
+                campaign: JsonType = deepcopy(raw_campaign)
+                game = campaign.get("game")
+                if not isinstance(game, dict):
+                    continue
+                game.setdefault("boxArtURL", box_art_url)
+
+                # The public catalog can't know account linkage state. Inventory data,
+                # when present, wins during the merge below. For catalog-only campaigns
+                # assume eligibility so they stay mineable; Twitch still enforces
+                # actual account linkage server-side.
+                if not isinstance(campaign.get("self"), dict):
+                    campaign["self"] = {"isAccountConnected": True}
+                else:
+                    campaign["self"].setdefault("isAccountConnected", True)
+
+                allowed = campaign.get("allow")
+                if not isinstance(allowed, dict):
+                    allowed = {"isEnabled": False, "channels": None}
+                    campaign["allow"] = allowed
+                else:
+                    allowed.setdefault("channels", None)
+
+                if not isinstance(campaign.get("timeBasedDrops"), list):
+                    campaign["timeBasedDrops"] = []
+                campaign.setdefault("accountLinkURL", "")
+                campaigns[campaign_id] = campaign
+
+        logger.warning(
+            "Twitch did not expose the full campaign list to the login client; "
+            f"using public campaign metadata fallback ({len(campaigns)} campaigns)."
+        )
+        return campaigns
+
     async def fetch_inventory(self) -> None:
         status_update = self.gui.status.update
         status_update(_("gui", "status", "fetching_inventory"))
@@ -1435,20 +1633,30 @@ class Twitch:
         }
         # fetch detailed data for each campaign, in chunks
         status_update(_("gui", "status", "fetching_campaigns"))
-        fetch_campaigns_tasks: list[asyncio.Task[Any]] = [
-            asyncio.create_task(self.fetch_campaigns(campaigns_chunk))
-            for campaigns_chunk in chunk(available_campaigns.items(), 20)
-        ]
-        try:
-            for coro in asyncio.as_completed(fetch_campaigns_tasks):
-                chunk_campaigns_data = await coro
-                # merge the inventory and campaigns datas together
-                inventory_data = self._merge_data(inventory_data, chunk_campaigns_data)
-        except Exception:
-            # asyncio.as_completed doesn't cancel tasks on errors
-            for task in fetch_campaigns_tasks:
-                task.cancel()
-            raise
+        auth_state = await self.get_auth()
+        if auth_state.needs_catalog_fallback:
+            # Tokens minted under the login client authenticate, but Twitch does
+            # not expose the complete campaign dashboard to that client. Use public
+            # metadata for discovery and keep account-specific inventory data
+            # authoritative.
+            catalog_campaigns = await self.fetch_campaign_catalog()
+            inventory_data = self._merge_data(inventory_data, catalog_campaigns)
+        else:
+            # Normal clients can still resolve campaign details directly from Twitch.
+            fetch_campaigns_tasks: list[asyncio.Task[Any]] = [
+                asyncio.create_task(self.fetch_campaigns(campaigns_chunk))
+                for campaigns_chunk in chunk(available_campaigns.items(), 20)
+            ]
+            try:
+                for coro in asyncio.as_completed(fetch_campaigns_tasks):
+                    chunk_campaigns_data = await coro
+                    # merge the inventory and campaigns datas together
+                    inventory_data = self._merge_data(inventory_data, chunk_campaigns_data)
+            except Exception:
+                # asyncio.as_completed doesn't cancel tasks on errors
+                for task in fetch_campaigns_tasks:
+                    task.cancel()
+                raise
         # filter out invalid campaigns
         for campaign_id in list(inventory_data.keys()):
             if inventory_data[campaign_id]["game"] is None:

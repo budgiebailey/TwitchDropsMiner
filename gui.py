@@ -2184,12 +2184,13 @@ class HelpTab:
         asyncio.create_task(task_wrapper(self._invalidate_token)())
 
     async def _invalidate_token(self) -> None:
+        from twitch import _AuthState  # deferred to avoid a cyclic import
         auth_state = await self._twitch.get_auth()
         async with self._twitch.request(
             "POST",
             "https://id.twitch.tv/oauth2/revoke",
             data={
-                "client_id": self._twitch._client_type.CLIENT_ID,
+                "client_id": _AuthState.LOGIN_CLIENT.CLIENT_ID,
                 "token": auth_state.access_token,
             }
         ) as response:
